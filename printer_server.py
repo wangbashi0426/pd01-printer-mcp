@@ -4,16 +4,26 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+os.environ.setdefault("FASTMCP_CHECK_FOR_UPDATES", "off")
+
 from bleak import BleakClient, BleakScanner
-from fastmcp import FastMCP
+from dotenv import load_dotenv
+from fastmcp import Client, FastMCP
 from PIL import Image, ImageDraw, ImageFont
+
+from telegram_ledger import DeliveryLedger
+
+load_dotenv()
 
 if os.name == "nt":
     from winrt.windows.devices.bluetooth import BluetoothCacheMode, BluetoothLEDevice
@@ -30,6 +40,13 @@ DEVICE_ADDRESS = os.getenv("PD01_DEVICE_ADDRESS", "").strip()
 MCP_HOST = os.getenv("MCP_HOST", "127.0.0.1")
 MCP_PORT = int(os.getenv("MCP_PORT", "4176"))
 PRINT_ENERGY = int(os.getenv("PD01_PRINT_ENERGY", "32768"))
+RELAY_URL = os.getenv("TELEGRAM_RELAY_URL", "").strip()
+RELAY_ACCESS_TOKEN = os.getenv("TELEGRAM_RELAY_ACCESS_TOKEN", "").strip()
+RELAY_WORKER_SECRET = os.getenv("TELEGRAM_RELAY_WORKER_SECRET", "").strip()
+AUTOPRINT_ENABLED = os.getenv("TELEGRAM_AUTOPRINT", "0") == "1"
+RELAY_POLL_SECONDS = max(5, int(os.getenv("TELEGRAM_POLL_SECONDS", "20")))
+DEVICE_ID = os.getenv("TELEGRAM_DEVICE_ID", "home-pd01")[:80]
+LEDGER_PATH = Path(os.getenv("TELEGRAM_LEDGER_PATH", "telegram_delivery.sqlite3"))
 
 PAPER_WIDTH = 384
 BYTES_PER_LINE = PAPER_WIDTH // 8
@@ -47,9 +64,27 @@ FONT_CANDIDATES = (
     r"C:\Windows\Fonts\simsun.ttc",
 )
 
-mcp = FastMCP("pd01-printer")
 current_client: Any | None = None
 print_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def printer_lifespan(_: FastMCP):
+    worker_task: asyncio.Task | None = None
+    if AUTOPRINT_ENABLED and RELAY_URL and RELAY_WORKER_SECRET:
+        worker_task = asyncio.create_task(run_relay_worker(), name="telegram-relay-worker")
+    try:
+        yield
+    finally:
+        if worker_task is not None:
+            worker_task.cancel()
+            try:
+                await worker_task
+            except asyncio.CancelledError:
+                pass
+
+
+mcp = FastMCP("pd01-printer", lifespan=printer_lifespan)
 
 
 @dataclass
@@ -64,6 +99,14 @@ class PreparedJob:
 
 
 pending_jobs: dict[str, PreparedJob] = {}
+
+
+class PrintAttemptError(RuntimeError):
+    """Printer failure with an explicit physical-output uncertainty flag."""
+
+    def __init__(self, message: str, *, uncertain: bool):
+        super().__init__(message)
+        self.uncertain = uncertain
 
 
 def crc8(data: bytes) -> int:
@@ -372,7 +415,10 @@ async def print_png(png_data: bytes) -> dict[str, int | bool]:
     global current_client
     rows = png_to_rows(png_data)
     async with print_lock:
-        client = await ensure_connected()
+        try:
+            client = await ensure_connected()
+        except Exception as error:
+            raise PrintAttemptError(str(error), uncertain=False) from error
         data = bytearray()
         data.extend(STATE_QUERY)
         data.extend(QUALITY_200_DPI)
@@ -386,6 +432,7 @@ async def print_png(png_data: bytes) -> dict[str, int | bool]:
         data.extend(LATTICE_END)
         data.extend(STATE_QUERY)
 
+        chunks_written = 0
         try:
             for offset in range(0, len(data), 123):
                 await client.write_gatt_char(
@@ -393,15 +440,217 @@ async def print_png(png_data: bytes) -> dict[str, int | bool]:
                     data[offset : offset + 123],
                     response=False,
                 )
+                chunks_written += 1
                 await asyncio.sleep(0.01)
-        except Exception:
+        except Exception as error:
             try:
                 await client.disconnect()
             finally:
                 current_client = None
-            raise
+            raise PrintAttemptError(
+                str(error), uncertain=chunks_written > 0
+            ) from error
 
     return {"printed": True, "rows": len(rows), "bytes_sent": len(data)}
+
+
+def _telegram_hash(text: str, font_size: int, align: str) -> str:
+    payload = f"{font_size}\0{align}\0{text}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+async def _relay_call(client: Client, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    result = await client.call_tool(name, arguments, timeout=30)
+    if result.is_error:
+        raise RuntimeError(f"relay tool failed: {name}")
+    if not isinstance(result.data, dict):
+        raise RuntimeError(f"relay returned invalid data for {name}")
+    return result.data
+
+
+async def _ack_without_reprint(
+    client: Client,
+    ledger: DeliveryLedger,
+    job_id: str,
+    lease_id: str,
+    digest: str,
+) -> None:
+    response = await _relay_call(
+        client,
+        "acknowledge_telegram",
+        {
+            "worker_secret": RELAY_WORKER_SECRET,
+            "job_id": job_id,
+            "lease_id": lease_id,
+        },
+    )
+    if not response.get("acknowledged"):
+        raise RuntimeError("relay did not acknowledge a locally completed telegram")
+    ledger.mark_acked(job_id, digest)
+
+
+async def process_relay_job(
+    client: Client, ledger: DeliveryLedger, job: dict[str, Any]
+) -> None:
+    job_id = str(job.get("job_id", ""))
+    lease_id = str(job.get("lease_id", ""))
+    text = job.get("text")
+    font_size = int(job.get("font_size", 24))
+    align = str(job.get("align", "left"))
+    expected_hash = str(job.get("content_hash", ""))
+    if not job_id or not lease_id or not isinstance(text, str):
+        raise RuntimeError("relay leased an incomplete telegram")
+
+    digest = _telegram_hash(text, font_size, align)
+    if not secrets.compare_digest(digest, expected_hash):
+        await _relay_call(
+            client,
+            "mark_telegram_uncertain",
+            {
+                "worker_secret": RELAY_WORKER_SECRET,
+                "job_id": job_id,
+                "lease_id": lease_id,
+                "error": "content hash mismatch",
+            },
+        )
+        return
+
+    receipt = ledger.get(job_id)
+    if receipt is not None:
+        if receipt["content_hash"] != digest:
+            await _relay_call(
+                client,
+                "mark_telegram_uncertain",
+                {
+                    "worker_secret": RELAY_WORKER_SECRET,
+                    "job_id": job_id,
+                    "lease_id": lease_id,
+                    "error": "local receipt hash mismatch",
+                },
+            )
+            return
+        if receipt["state"] in {"printed", "acked"}:
+            await _ack_without_reprint(client, ledger, job_id, lease_id, digest)
+            return
+        if receipt["state"] in {"printing", "uncertain"}:
+            ledger.mark_uncertain(job_id, digest, "previous print attempt ended without certainty")
+            await _relay_call(
+                client,
+                "mark_telegram_uncertain",
+                {
+                    "worker_secret": RELAY_WORKER_SECRET,
+                    "job_id": job_id,
+                    "lease_id": lease_id,
+                    "error": "previous print attempt ended without certainty",
+                },
+            )
+            return
+
+    ledger.mark_printing(job_id, digest)
+    try:
+        png_data, _, _, _ = render_text(text, font_size, align)
+        await print_png(png_data)
+    except PrintAttemptError as error:
+        if error.uncertain:
+            ledger.mark_uncertain(job_id, digest, str(error))
+            await _relay_call(
+                client,
+                "mark_telegram_uncertain",
+                {
+                    "worker_secret": RELAY_WORKER_SECRET,
+                    "job_id": job_id,
+                    "lease_id": lease_id,
+                    "error": str(error),
+                },
+            )
+        else:
+            ledger.clear_safe_failure(job_id, digest)
+            await _relay_call(
+                client,
+                "release_telegram",
+                {
+                    "worker_secret": RELAY_WORKER_SECRET,
+                    "job_id": job_id,
+                    "lease_id": lease_id,
+                    "error": str(error),
+                    "retry_after": 60,
+                },
+            )
+        return
+    except Exception as error:
+        ledger.clear_safe_failure(job_id, digest)
+        await _relay_call(
+            client,
+            "release_telegram",
+            {
+                "worker_secret": RELAY_WORKER_SECRET,
+                "job_id": job_id,
+                "lease_id": lease_id,
+                "error": str(error),
+                "retry_after": 60,
+            },
+        )
+        return
+
+    ledger.mark_printed(job_id, digest)
+    await _ack_without_reprint(client, ledger, job_id, lease_id, digest)
+
+
+async def run_relay_worker() -> None:
+    ledger = DeliveryLedger(LEDGER_PATH)
+    while True:
+        try:
+            client_kwargs: dict[str, Any] = {"timeout": 35}
+            if RELAY_ACCESS_TOKEN:
+                client_kwargs["auth"] = RELAY_ACCESS_TOKEN
+            async with Client(RELAY_URL, **client_kwargs) as client:
+                while True:
+                    response = await _relay_call(
+                        client,
+                        "lease_next_telegram",
+                        {
+                            "worker_secret": RELAY_WORKER_SECRET,
+                            "device_id": DEVICE_ID,
+                            "lease_seconds": 180,
+                        },
+                    )
+                    job = response.get("job") if response.get("leased") else None
+                    if isinstance(job, dict):
+                        await process_relay_job(client, ledger, job)
+                    else:
+                        await asyncio.sleep(RELAY_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(RELAY_POLL_SECONDS)
+
+
+@mcp.tool()
+async def scan_printers(timeout_seconds: int = 8) -> dict[str, Any]:
+    """Scan for nearby BLE printer names without connecting, printing, or exposing addresses."""
+    timeout_seconds = min(max(timeout_seconds, 2), 20)
+    devices = await BleakScanner.discover(timeout=timeout_seconds)
+    names = sorted({device.name for device in devices if device.name})
+    return {
+        "ok": True,
+        "devices": [{"name": name, "configured_match": name == DEVICE_NAME} for name in names],
+        "paper_used": False,
+    }
+
+
+@mcp.tool()
+def telegram_worker_status() -> dict[str, Any]:
+    """Read the local relay worker configuration and receipt counts without exposing secrets."""
+    ledger = DeliveryLedger(LEDGER_PATH)
+    configured = bool(RELAY_URL and RELAY_WORKER_SECRET)
+    return {
+        "enabled": AUTOPRINT_ENABLED,
+        "configured": configured,
+        "device_id": DEVICE_ID,
+        "poll_seconds": RELAY_POLL_SECONDS,
+        "receipt_counts": ledger.summary(),
+        "paper_used": False,
+    }
 
 
 @mcp.tool()
